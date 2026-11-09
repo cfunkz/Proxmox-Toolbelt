@@ -1,0 +1,29 @@
+# Copy to /etc/proxmox-toolbelt.conf (root-owned, not group/world writable) to change
+# the defaults offered by the VM, container and template builders in proxmox-toolbelt.sh.
+# Every value is still asked interactively.
+
+#DEF_DISTRO="ubuntu-24.04"      # key from the distro menu
+#DEF_STORAGE="local-lvm"
+#DEF_BRIDGE="vmbr0"
+#DEF_DISK="32G"
+#DEF_MEM="2048"
+#DEF_CORES="2"
+#DEF_CPU="host"                 # x86-64-v2-AES for mixed-CPU clusters (not for EL10)
+#DEF_BIOS="ovmf"                # or seabios
+#DEF_FW="1"                     # 0 if a router VM (OPNsense etc.) does all filtering
+#DEF_SSHKEYS="/root/.ssh/authorized_keys"
+#DEF_DNS="1.1.1.1 9.9.9.9"      # blank = gateway of the first static NIC
+#DEF_SEARCHDOMAIN="lab.lan"
+#DEF_ONBOOT="1"
+#DEF_UPGRADE="1"
+#SNIPPET_STORAGE="local"
+#IMG_DIR="/var/lib/vz/template/cloudimg"
+#KEEP_ON_FAIL="0"               # 1 = keep a half-built VM for debugging
+#DEF_TEMPLATE_ID="9000"         # first VMID tried by the template builder
+#DEF_CT_TEMPLATE="debian-13-standard"   # container builder: template name without version
+#DEF_CT_STORAGE="local-lvm"     # root disk storage for containers
+#DEF_CT_DISK="8"                # GiB
+#DEF_CT_MEM="1024"
+#DEF_CT_SWAP="512"
+#DEF_CT_CORES="1"
+#BACKUP_ROOT="/root/proxmox-toolbelt-backups"   # where fixes back up the files they edit

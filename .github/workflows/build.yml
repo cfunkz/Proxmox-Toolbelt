@@ -1,0 +1,61 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: shellcheck -S warning proxmox-toolbelt.sh create-vm.sh create-ct.sh packaging/build-deb.sh tests/*.sh
+      - name: unit tests
+        run: |
+          bash tests/test-helpers.sh
+          bash tests/test-checks.sh
+
+  deb:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write       # create the release
+      id-token: write       # build provenance attestation
+      attestations: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build .deb
+        run: |
+          ver=""
+          [[ "$GITHUB_REF_TYPE" == tag ]] && ver="${GITHUB_REF_NAME#v}"
+          deb="$(bash packaging/build-deb.sh "$ver" dist)"
+          cp "$deb" dist/proxmox-toolbelt_all.deb   # fixed name for /releases/latest/download/
+          (cd dist && sha256sum ./*.deb > SHA256SUMS)
+          dpkg-deb -I "$deb"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: proxmox-toolbelt-deb
+          path: dist/
+      - name: Attest build provenance
+        if: github.ref_type == 'tag'
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/*.deb
+      - name: Publish release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/*.deb dist/SHA256SUMS --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/*.deb dist/SHA256SUMS \
+              --title "proxmox-toolbelt ${GITHUB_REF_NAME#v}" --generate-notes --verify-tag
+          fi
