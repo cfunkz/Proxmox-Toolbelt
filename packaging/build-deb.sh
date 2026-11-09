@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 cd "$(dirname "$(readlink -f "$0")")/.."
 
-MAINTAINER="cfunkz <cfunkz@pm.me>"
+MAINTAINER="cfunkz <116670695+cfunkz@users.noreply.github.com>"
 HOMEPAGE="https://github.com/cfunkz/Proxmox-Toolbelt"
 PKG=proxmox-toolbelt
 

@@ -59,5 +59,14 @@ no "dns bad" v_dns "1.1.1" 2>/dev/null
 no "name underscore" v_name "bad_name" 2>/dev/null
 ok "name fqdn" v_name "web-01.lab.lan"
 
+k="$(mktemp)"
+printf 'ssh-ed25519 AAAAC3Nza one@host\r\nssh-ed25519 AAAAC3Nzb second key\r\nfrom="10.0.0.1" ssh-rsa AAAAB3Nza opt\r\n# note\r\n\r\n' >"$k"
+eq "pubkeys drop CR" "$(pubkey_lines "$k" | grep -c $'\r')" 0
+eq "pubkeys count" "$(pubkey_lines "$k" | grep -c .)" 3
+eq "pubkeys options removed" "$(pubkey_lines "$k" | sed -n 3p)" "ssh-rsa AAAAB3Nza opt"
+eq "pubkey label" "$(pubkey_label "$k")" "3 key(s): one@host, second key, opt"
+eq "pasted key" "$(printf 'ssh-ed25519 AAAA x\r' | pubkey_lines)" "ssh-ed25519 AAAA x"
+rm -f "$k"
+
 echo "$pass passed, $fail failed"
 (( fail == 0 ))

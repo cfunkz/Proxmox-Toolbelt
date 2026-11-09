@@ -13,7 +13,7 @@
 set -Eeuo pipefail
 umask 077
 
-VERSION="0.0.1"
+VERSION="0.0.2"
 
 # ---------------------------------------------------------------------------
 # Defaults (override in /etc/proxmox-toolbelt.conf, see proxmox-toolbelt.conf.example)
@@ -959,6 +959,25 @@ view_tfa() {
   hint "Token format: id:privsep:expire. privsep=0 grants the token all permissions of its user."
 }
 
+# pubkey_lines [FILE]: public keys from FILE (or stdin), one per line. Drops CR (files edited
+# on Windows), control characters and authorized_keys options before the key type.
+pubkey_lines() {
+  tr -d '\r' <"${1:-/dev/stdin}" | tr -d '\000-\010\013-\037\177' | awk '{
+    for (i = 1; i <= NF; i++) if ($i ~ /^(ssh-(ed25519|rsa|dss)|ecdsa-sha2-|sk-)/) break
+    if (i >= NF) next
+    out = $i; for (j = i + 1; j <= NF; j++) out = out " " $j; print out }'
+}
+
+# pubkey_label FILE: "N key(s): comment1, comment2, ..." (at most 3 comments, 60 characters)
+pubkey_label() {
+  local n names
+  n="$(pubkey_lines "$1" | grep -c . || true)"
+  names="$(pubkey_lines "$1" | awk 'NR<=3{c=""; for (j = 3; j <= NF; j++) c = c (c == "" ? "" : " ") $j; print (c == "" ? $1 : c)}' | paste -sd, - | sed 's/,/, /g')"
+  (( n > 3 )) && names+=", ..."
+  (( ${#names} > 60 )) && names="${names:0:57}..."
+  echo "$n key(s): $names"
+}
+
 ssh_valid_keys() { ssh_key_info "$ROOT_KEYS" | grep -c . || true; }
 
 fix_ssh_addkey() {
@@ -967,8 +986,8 @@ fix_ssh_addkey() {
   local in tmp; tmp="$(mktemp)"; TMP_FILES+=("$tmp")
   while true; do
     ask in "Key or file" "" v_any
-    if [[ -f "$in" ]]; then grep -E '^(ssh-|ecdsa-|sk-)' "$in" >"$tmp" || true
-    else printf '%s\n' "$in" >"$tmp"; fi
+    if [[ -f "$in" ]]; then pubkey_lines "$in" >"$tmp"
+    else printf '%s\n' "$in" | pubkey_lines >"$tmp"; fi
     if [[ -s "$tmp" ]] && ssh-keygen -l -f "$tmp" >/dev/null 2>&1; then break; fi
     echo "  Not a valid SSH public key" >&2
   done
@@ -2128,9 +2147,9 @@ pick_sshkeys() {
   for f in "$DEF_SSHKEYS" /root/.ssh/authorized_keys /root/.ssh/*.pub ${home:+"$home"/.ssh/*.pub}; do
     [[ -s "$f" ]] || continue
     ip_in_use "$f" "${opts[@]%%|*}" && continue
-    cnt="$(grep -cE '^(ssh-|ecdsa-|sk-)' "$f" || true)"
+    cnt="$(pubkey_lines "$f" | grep -c . || true)"
     (( cnt )) || continue
-    opts+=("$f|$cnt key(s): $(grep -E '^(ssh-|ecdsa-|sk-)' "$f" | awk 'NR<=3{print $NF}' | paste -sd, -)")
+    opts+=("$f|$(pubkey_label "$f")")
     [[ "$def_keys" == none ]] && def_keys="$f"
   done
   opts+=("none|no SSH key (password login only)")
@@ -2138,8 +2157,8 @@ pick_sshkeys() {
     MENU_FREE=v_any menu keys "SSH key file, or paste a public key" "$def_keys" "${opts[@]}"
     [[ "$keys" == none ]] && break
     SSHKEY_FILE="$(mktemp)"; TMP_FILES+=("$SSHKEY_FILE")
-    if [[ -f "$keys" ]]; then grep -E '^(ssh-|ecdsa-|sk-)' "$keys" >"$SSHKEY_FILE" || true
-    else printf '%s\n' "$keys" >"$SSHKEY_FILE"; fi
+    if [[ -f "$keys" ]]; then pubkey_lines "$keys" >"$SSHKEY_FILE"
+    else printf '%s\n' "$keys" | pubkey_lines >"$SSHKEY_FILE"; fi
     if [[ -s "$SSHKEY_FILE" ]] && ssh-keygen -l -f "$SSHKEY_FILE" >/dev/null 2>&1; then
       log "$(wc -l <"$SSHKEY_FILE") SSH key(s) accepted"; break
     fi
