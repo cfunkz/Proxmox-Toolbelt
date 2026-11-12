@@ -13,7 +13,7 @@
 set -Eeuo pipefail
 umask 077
 
-VERSION="0.0.2"
+VERSION="0.0.3"
 
 # ---------------------------------------------------------------------------
 # Defaults (override in /etc/proxmox-toolbelt.conf, see proxmox-toolbelt.conf.example)
@@ -817,7 +817,7 @@ CHECKS=(
   "SECURITY|chk_tfa" "SECURITY|chk_ssh" "SECURITY|chk_cert" "SECURITY|chk_firewall"
   "UPDATES|chk_repos" "UPDATES|chk_updates" "UPDATES|chk_microcode"
   "STORAGE|chk_storage" "STORAGE|chk_disks"
-  "BACKUPS AND ALERTS|chk_backups" "BACKUPS AND ALERTS|chk_notify"
+  "BACKUPS AND ALERTS|chk_backups" "BACKUPS AND ALERTS|chk_schedule" "BACKUPS AND ALERTS|chk_notify"
   "SYSTEM|chk_system"
 )
 
@@ -1555,6 +1555,1078 @@ view_backup_tasks() {
     printf '  %s  %4s min  %s%s%s\n' "$(date -d "@$start" '+%F %H:%M')" "$(( (${end:-$start} - start) / 60 ))" "$col" "${status:-running}" "$C_0"
   done < <(pj "/nodes/$NODE/tasks" --typefilter vzdump --limit 20 | jrows upid starttime endtime status user)
   hint "Logs: Node > Task History, or pvenode task log <UPID>"
+}
+
+# ---------------------------------------------------------------------------
+# Scheduled snapshots and backups
+# ---------------------------------------------------------------------------
+# A job is $SCHED_DIR/NAME.conf: KEY=value lines, validated and never sourced.
+# The timer proxmox-toolbelt-job@NAME.timer fires on a calendar grid (the "tick", for example
+# hourly) with Persistent=true, so a tick missed while the node was off fires right after boot.
+# Each tick runs "proxmox-toolbelt schedule tick NAME". It compares the tick with the last
+# completed run in $SCHED_STATE/NAME.state and starts the job only when the interval has passed.
+# That keeps intervals that no calendar expression covers (10h, 36h, 3 months) evenly spaced.
+# A run cut short by a reboot or crash does not count as completed: it runs again after boot
+# (proxmox-toolbelt-schedule-recover.service), after stale guest locks it left are cleared.
+SCHED_DIR="${SCHED_DIR:-/etc/proxmox-toolbelt/schedule}"
+SCHED_STATE="${SCHED_STATE:-/var/lib/proxmox-toolbelt/schedule}"
+SCHED_LOG="${SCHED_LOG:-/var/log/proxmox-toolbelt}"
+SCHED_LOCKS="${SCHED_LOCKS:-/run/lock}"
+UNIT_DIR="${UNIT_DIR:-/etc/systemd/system}"
+SCHED_ATTEMPTS="${SCHED_ATTEMPTS:-3}"        # tries per guest (snapshot) or per run (backup)
+SCHED_RETRY_WAIT="${SCHED_RETRY_WAIT:-60}"   # seconds between tries
+SCHED_LOG_LINES=5000                         # each job log is trimmed to this many lines
+JOB_UNIT="proxmox-toolbelt-job"
+RECOVER_UNIT="proxmox-toolbelt-schedule-recover.service"
+SCHED_PROGS=(/usr/local/sbin/proxmox-toolbelt /usr/sbin/proxmox-toolbelt)   # systemd's search order
+declare -A J=()
+
+sched_now() { echo "${SCHED_NOW:-$(date +%s)}"; }
+fmt_ts() { if [[ "${1:-}" =~ ^[0-9]+$ ]]; then date -d "@$1" '+%F %H:%M'; else echo "-"; fi; }
+gcd() { local a="$1" b="$2" t; while (( b )); do t=$(( a % b )); a=$b; b=$t; done; echo "$a"; }
+
+# parse_every SPEC: prints "MINUTES MONTHS" (one of them 0). Accepts 10m, 90min, 10h, 24h, 1d,
+# 2w, 3mo, combinations such as 1h30m or 1d12h, and hourly, daily, weekly, monthly.
+# "m" is minutes; months are "mo". From 5 minutes up to 1 year, or 1 to 120 months.
+parse_every() {
+  local s="${1,,}" min=0 mon=0 n u
+  s="${s//[[:space:]]/}"
+  case "$s" in hourly) s=1h ;; daily) s=1d ;; weekly) s=1w ;; monthly) s=1mo ;; esac
+  [[ -n "$s" ]] || return 1
+  local re='^([0-9]{1,6})(months?|mo|minutes?|mins?|m|hours?|hrs?|h|days?|d|weeks?|w)(([0-9].*)?)$'
+  while [[ -n "$s" ]]; do
+    [[ "$s" =~ $re ]] || return 1
+    n=$(( 10#${BASH_REMATCH[1]} )) u="${BASH_REMATCH[2]}" s="${BASH_REMATCH[3]}"
+    case "$u" in
+      mo|month*) mon=$(( mon + n )) ;;
+      m|min*) min=$(( min + n )) ;;
+      h*) min=$(( min + n * 60 )) ;;
+      d*) min=$(( min + n * 1440 )) ;;
+      w*) min=$(( min + n * 10080 )) ;;
+    esac
+  done
+  if (( mon )); then (( min == 0 && mon <= 120 )) || return 1
+  else (( min >= 5 && min <= 525600 )) || return 1; fi
+  echo "$min $mon"
+}
+
+# every_text MINUTES MONTHS: "every 10 hours"
+every_text() {
+  local min="$1" mon="$2" u n c
+  if (( mon )); then if (( mon == 1 )); then echo "every month"; else echo "every $mon months"; fi; return 0; fi
+  for u in "10080 week" "1440 day" "60 hour" "1 minute"; do
+    n="${u%% *}"
+    (( min % n == 0 )) || continue
+    c=$(( min / n ))
+    if (( c == 1 )); then echo "every ${u#* }"; else echo "every $c ${u#* }s"; fi
+    return 0
+  done
+}
+
+# sched_tick MINUTES MONTHS AT: "SECONDS|OnCalendar" of the timer grid. Whole days, weeks and
+# months tick daily at AT; other intervals tick every gcd(interval, 60) minutes (10m -> 10 min,
+# 45m -> 15 min, 10h -> hourly), so every run lands on the grid.
+sched_tick() {
+  local min="$1" mon="$2" at="${3:-00:00}" t
+  if (( mon || min % 1440 == 0 )); then echo "86400|*-*-* $at:00"; return 0; fi
+  t="$(gcd "$min" 60)"
+  if (( t == 60 )); then echo "3600|*-*-* *:00:00"; else echo "$(( t * 60 ))|*-*-* *:00/$t:00"; fi
+}
+
+# sched_slot NOW TICK AT: start of the grid period that contains NOW (local time)
+sched_slot() {
+  local now="$1" tick="$2" at="${3:-00:00}" s z off
+  if (( tick == 86400 )); then
+    s="$(date -d "$(date -d "@$now" +%F) $at" +%s 2>/dev/null)" || s=$(( now - now % 3600 ))
+    if (( s > now )); then
+      s="$(date -d "$(date -d "@$(( now - 86400 ))" +%F) $at" +%s 2>/dev/null)" || s=$(( now - now % 3600 ))
+    fi
+    echo "$s"; return 0
+  fi
+  z="$(date -d "@$now" +%z)"
+  off=$(( 10#${z:1:2} * 3600 + 10#${z:3:2} * 60 )); [[ "${z:0:1}" == - ]] && off=$(( -off ))
+  echo $(( now - (now + off) % tick ))
+}
+
+# sched_due SLOT LAST MINUTES MONTHS TICK: 0 when a run is due in SLOT. LAST is the slot of the
+# last completed run. Day intervals allow half a tick of slack (DST); months count calendar
+# months, so "1mo" runs on the 1st of each month (the first run happens at the next tick).
+sched_due() {
+  local slot="$1" last="$2" min="$3" mon="$4" tick="$5" y1 m1 y2 m2
+  [[ "$last" =~ ^[0-9]+$ ]] || return 0
+  (( slot > last )) || return 1
+  if (( mon )); then
+    read -r y1 m1 <<<"$(date -d "@$last" '+%Y %m')"
+    read -r y2 m2 <<<"$(date -d "@$slot" '+%Y %m')"
+    (( (10#$y2 * 12 + 10#$m2) - (10#$y1 * 12 + 10#$m1) >= mon ))
+  else
+    (( slot - last >= min * 60 - tick / 2 ))
+  fi
+}
+
+# next_due_text NAME: when the next run is expected (J loaded)
+next_due_text() {
+  local name="$1" last min mon at="${J[AT]}" st
+  if ! systemctl is-enabled --quiet "$JOB_UNIT@$name.timer" 2>/dev/null; then echo "paused"; return 0; fi
+  if [[ -n "${J[CALENDAR]}" ]]; then
+    local us; us="$(systemctl show -p NextElapseUSecRealtime --value "$JOB_UNIT@$name.timer" 2>/dev/null || true)"
+    if [[ -n "$us" && "$us" != n/a ]]; then date -d "$us" '+%F %H:%M' 2>/dev/null || echo "$us"; else echo "?"; fi
+    return 0
+  fi
+  st="$(state_get "$name" status)"
+  last="$(state_get "$name" last_slot)"
+  [[ "$st" == running ]] && { echo "running"; return 0; }
+  if ! [[ "$last" =~ ^[0-9]+$ ]]; then
+    local us; us="$(systemctl show -p NextElapseUSecRealtime --value "$JOB_UNIT@$name.timer" 2>/dev/null || true)"
+    if [[ -n "$us" && "$us" != n/a ]]; then date -d "$us" '+%F %H:%M' 2>/dev/null || echo "next tick"; else echo "next tick"; fi
+    return 0
+  fi
+  read -r min mon <<<"$(parse_every "${J[EVERY]}")"
+  if (( mon )); then date -d "$(date -d "@$last" +%Y-%m-01) $at +$mon month" '+%F %H:%M' 2>/dev/null || echo "?"
+  else fmt_ts $(( last + min * 60 )); fi
+}
+
+# ---- job files ---------------------------------------------------------------
+JOB_KEYS=(TYPE EVERY AT CALENDAR GUESTS EXCLUDE KEEP RETENTION VMSTATE STORAGE MODE COMPRESS MAX_USED NOTIFY)
+job_file()   { echo "$SCHED_DIR/$1.conf"; }
+state_file() { echo "$SCHED_STATE/$1.state"; }
+job_names()  { local f; for f in "$SCHED_DIR"/*.conf; do [[ -f "$f" ]] || continue; f="${f##*/}"; echo "${f%.conf}"; done; }
+
+v_jobname() { [[ "$1" =~ ^[a-z][a-z0-9_]{0,19}$ ]] || { echo "  Lowercase letters, digits and _, up to 20 characters, starting with a letter" >&2; return 1; }; }
+v_newjob()  { v_jobname "$1" || return 1; [[ ! -e "$(job_file "$1")" ]] || { echo "  Job $1 already exists" >&2; return 1; }; }
+v_every() {
+  if [[ "$1" == cal:* ]]; then v_calendar "${1#cal:}"; return; fi
+  parse_every "$1" >/dev/null || { echo "  Use an interval such as 10m, 30m, 1h, 10h, 24h, 1d, 1w, 1mo or 1h30m (5 minutes or more), or cal:<calendar>" >&2; return 1; }
+}
+v_calendar() {
+  local re='^[A-Za-z0-9 ,.:/*~+-]+$'
+  [[ "$1" =~ $re ]] || { echo "  Calendar: letters, digits, spaces and , . : / * ~ + -" >&2; return 1; }
+  if command -v systemd-analyze >/dev/null && ! systemd-analyze calendar "$1" >/dev/null 2>&1; then
+    echo "  systemd does not accept '$1' (try: systemd-analyze calendar '$1')" >&2; return 1
+  fi
+}
+v_at()      { [[ "$1" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]] || { echo "  Time as HH:MM, e.g. 02:00" >&2; return 1; }; }
+v_guests()  { [[ "$1" =~ ^(all|pool:[A-Za-z0-9_.-]+|[0-9]+(-[0-9]+)?(,[0-9]+(-[0-9]+)?)*)$ ]] || { echo "  all, pool:NAME, or IDs such as 100,101,200-210" >&2; return 1; }; }
+v_idlist()  { [[ -z "$1" || "$1" == none || "$1" =~ ^[0-9]+(-[0-9]+)?(,[0-9]+(-[0-9]+)?)*$ ]] || { echo "  IDs such as 100,105-110, or blank" >&2; return 1; }; }
+v_keep()    { [[ "$1" =~ ^[0-9]{1,4}$ ]] && (( 10#$1 >= 1 )) || { echo "  A number from 1" >&2; return 1; }; }
+v_pct()     { [[ "$1" =~ ^[0-9]{2}$ ]] && (( 10#$1 >= 50 )) || { echo "  A percentage from 50 to 99" >&2; return 1; }; }
+v_retention() {
+  local k='keep-(last|hourly|daily|weekly|monthly|yearly)=[0-9]+'
+  [[ -z "$1" || "$1" == none || "$1" =~ ^$k(,$k)*$ ]] || { echo "  e.g. keep-daily=7,keep-weekly=4,keep-monthly=6 (or blank)" >&2; return 1; }
+}
+
+# job_check KEY VALUE: validates one job setting
+job_check() {
+  local k="$1" v="$2"
+  case "$k" in
+    TYPE) [[ "$v" == snapshot || "$v" == backup ]] ;;
+    EVERY) [[ -z "$v" ]] || parse_every "$v" >/dev/null ;;
+    AT) v_at "$v" 2>/dev/null ;;
+    CALENDAR) [[ -z "$v" ]] || v_calendar "$v" 2>/dev/null ;;
+    GUESTS) v_guests "$v" 2>/dev/null ;;
+    EXCLUDE) [[ "$v" != none ]] && v_idlist "$v" 2>/dev/null ;;
+    KEEP) v_keep "$v" 2>/dev/null ;;
+    RETENTION) [[ "$v" != none ]] && v_retention "$v" 2>/dev/null ;;
+    VMSTATE) [[ "$v" == 0 || "$v" == 1 ]] ;;
+    STORAGE) [[ -z "$v" || "$v" =~ ^[A-Za-z][A-Za-z0-9_.-]*$ ]] ;;
+    MODE) [[ "$v" =~ ^(snapshot|suspend|stop)$ ]] ;;
+    COMPRESS) [[ "$v" =~ ^(zstd|lzo|gzip|0)$ ]] ;;
+    MAX_USED) v_pct "$v" 2>/dev/null ;;
+    NOTIFY) [[ "$v" =~ ^(failure|always|never)$ ]] ;;
+    *) return 1 ;;
+  esac
+}
+
+job_defaults() {
+  J=([NAME]="${1:-}" [TYPE]="" [EVERY]="" [AT]="02:00" [CALENDAR]="" [GUESTS]="" [EXCLUDE]="" [KEEP]="7"
+     [RETENTION]="" [VMSTATE]="0" [STORAGE]="" [MODE]="snapshot" [COMPRESS]="zstd" [MAX_USED]="90" [NOTIFY]="failure")
+}
+
+# job_check_all: settings that depend on each other (J filled)
+job_check_all() {
+  local k
+  for k in "${JOB_KEYS[@]}"; do job_check "$k" "${J[$k]}" || { echo "invalid $k=${J[$k]}" >&2; return 1; }; done
+  [[ -n "${J[TYPE]}" ]] || { echo "TYPE is missing" >&2; return 1; }
+  [[ -n "${J[GUESTS]}" ]] || { echo "GUESTS is missing" >&2; return 1; }
+  [[ -n "${J[EVERY]}" || -n "${J[CALENDAR]}" ]] || { echo "EVERY or CALENDAR is required" >&2; return 1; }
+  [[ -z "${J[EVERY]}" || -z "${J[CALENDAR]}" ]] || { echo "set EVERY or CALENDAR, not both" >&2; return 1; }
+  [[ "${J[TYPE]}" != backup || -n "${J[STORAGE]}" ]] || { echo "STORAGE is required for backup jobs" >&2; return 1; }
+  return 0
+}
+
+# job_load NAME: reads the job into J
+job_load() {
+  local name="$1" f line k v n=0
+  v_jobname "$name" 2>/dev/null || { echo "Invalid job name: $name" >&2; return 1; }
+  f="$(job_file "$name")"
+  [[ -f "$f" ]] || { echo "Job $name not found ($f)" >&2; return 1; }
+  job_defaults "$name"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    n=$(( n + 1 )); line="${line%$'\r'}"
+    [[ "$line" =~ ^[[:space:]]*(#|$) ]] && continue
+    [[ "$line" =~ ^([A-Z_]+)=(.*)$ ]] || { echo "$f:$n: not KEY=value" >&2; return 1; }
+    k="${BASH_REMATCH[1]}" v="${BASH_REMATCH[2]}"
+    [[ "$v" == \"*\" ]] && { v="${v#\"}"; v="${v%\"}"; }
+    job_check "$k" "$v" || { echo "$f:$n: invalid $k=$v" >&2; return 1; }
+    J[$k]="$v"
+  done <"$f"
+  job_check_all || { echo "in $f" >&2; return 1; }
+}
+
+job_render() {
+  local k min=0 mon=0
+  [[ -n "${J[EVERY]}" ]] && read -r min mon <<<"$(parse_every "${J[EVERY]}")"
+  echo "# proxmox-toolbelt scheduled ${J[TYPE]} job. Read as KEY=value (not sourced)."
+  echo "# Change it with: proxmox-toolbelt schedule remove ${J[NAME]}; proxmox-toolbelt schedule add ..."
+  for k in "${JOB_KEYS[@]}"; do
+    [[ "${J[TYPE]}" == snapshot && "$k" =~ ^(STORAGE|MODE|COMPRESS|RETENTION)$ ]] && continue
+    [[ "${J[TYPE]}" == backup && "$k" == VMSTATE ]] && continue
+    [[ -n "${J[CALENDAR]}" && "$k" =~ ^(EVERY|AT)$ ]] && continue
+    [[ -z "${J[CALENDAR]}" && "$k" == CALENDAR ]] && continue
+    [[ "$k" == AT ]] && (( mon == 0 && min % 1440 != 0 )) && continue
+    echo "$k=${J[$k]}"
+  done
+}
+
+# schedule_text: "every 10 hours", "every day at 02:00", "calendar Mon..Fri 22:00" (J loaded)
+schedule_text() {
+  local min mon
+  if [[ -n "${J[CALENDAR]}" ]]; then echo "calendar ${J[CALENDAR]}"; return 0; fi
+  read -r min mon <<<"$(parse_every "${J[EVERY]}")"
+  if (( mon || min % 1440 == 0 )); then echo "$(every_text "$min" "$mon") at ${J[AT]}$( (( mon )) && echo ", on the 1st")"
+  else every_text "$min" "$mon"; fi
+}
+
+# ---- state -------------------------------------------------------------------
+state_get() { awk -v k="$2" 'index($0, k "=") == 1 { print substr($0, length(k) + 2); exit }' "$(state_file "$1")" 2>/dev/null || true; }
+# state_set NAME KEY=VALUE...: replaces those keys; written to a temp file, synced, renamed
+state_set() {
+  local f tmp; f="$(state_file "$1")"; shift
+  mkdir -p "$SCHED_STATE"
+  tmp="$(mktemp "$f.XXXXXX")"
+  { [[ -f "$f" ]] && cat "$f"; true; } | SET_KV="$(printf '%s\n' "$@" | tr -d '\r')" awk '
+    BEGIN { n = split(ENVIRON["SET_KV"], a, "\n"); for (i = 1; i <= n; i++) { if (a[i] == "") continue; k = a[i]; sub(/=.*/, "", k); v[k] = a[i]; o[++m] = k } }
+    { k = $0; sub(/=.*/, "", k); if (!(k in v)) print }
+    END { for (i = 1; i <= m; i++) print v[o[i]] }' >"$tmp"
+  sync "$tmp" 2>/dev/null || true
+  mv -f "$tmp" "$f"
+}
+
+# ---- job log -------------------------------------------------------------------
+JLOG=""
+jlog() {
+  local l; l="$(date '+%F %T') $*"
+  echo "$l"
+  if [[ -n "$JLOG" ]]; then echo "$l" >>"$JLOG" || true; fi
+}
+# jrun CMD...: runs CMD with its output in the job log; returns its exit code. JRUN_OUT gets a copy.
+JRUN_OUT=""
+jrun() {
+  if (( DRY_RUN )); then jlog "[dry-run] $*"; return 0; fi
+  jlog "\$ $*"
+  local ps=() l out="${JRUN_OUT:-/dev/null}"
+  "$@" 2>&1 </dev/null | tee "$out" | while IFS= read -r l; do jlog "  $l"; done && ps=("${PIPESTATUS[@]}") || ps=("${PIPESTATUS[@]}")
+  return "${ps[0]}"
+}
+log_notes() { local l; while IFS= read -r l; do jlog "note: $l"; done <"$JOB_TMP/notes" 2>/dev/null || true; }
+log_trim() {
+  [[ -f "$1" ]] || return 0
+  local n; n="$(wc -l <"$1")"
+  (( n > SCHED_LOG_LINES )) || return 0
+  local t; t="$(mktemp "$1.XXXXXX")"
+  tail -n $(( SCHED_LOG_LINES * 4 / 5 )) "$1" >"$t" && mv -f "$t" "$1"
+}
+
+# ---- guests --------------------------------------------------------------------
+# expand_ids "100,101,200-203": one VMID per line
+expand_ids() {
+  local part a b parts=()
+  IFS=, read -ra parts <<<"${1:-}"
+  for part in "${parts[@]}"; do
+    [[ "$part" =~ ^[0-9]+(-[0-9]+)?$ ]] || continue
+    if [[ "$part" == *-* ]]; then
+      a=$(( 10#${part%-*} )) b=$(( 10#${part#*-} ))
+      (( b - a <= 10000 )) || b=$(( a + 10000 ))
+      for (( ; a <= b; a++ )); do echo "$a"; done
+    else echo $(( 10#$part )); fi
+  done
+}
+
+guest_conf_path() { echo "$PVE_DIR/nodes/$NODE/$([[ $2 == lxc ]] && echo lxc || echo qemu-server)/$1.conf"; }
+
+# local_guests: "vmid|qemu or lxc|name|template" for each guest on this node
+local_guests() {
+  local f id t info
+  for f in "$PVE_DIR/nodes/$NODE/qemu-server/"*.conf "$PVE_DIR/nodes/$NODE/lxc/"*.conf; do
+    [[ -f "$f" ]] || continue
+    id="${f##*/}"; id="${id%.conf}"; [[ "$id" =~ ^[0-9]+$ ]] || continue
+    if [[ "$f" == */lxc/* ]]; then t=lxc; else t=qemu; fi
+    info="$(awk '/^\[/{exit} $1=="name:"||$1=="hostname:"{n=$2} $1=="template:"{tp=$2} END{printf "%s|%d", n, tp}' "$f")"
+    echo "$id|$t|$info"
+  done | sort -t'|' -k1,1n
+}
+
+# pool_members POOL: VMIDs in a resource pool
+pool_members() {
+  local j
+  j="$(pvesh get "/pools/$1" --output-format json 2>/dev/null)" \
+    || j="$(pvesh get /pools --poolid "$1" --output-format json 2>/dev/null)" || return 1
+  perl -MJSON::PP -e 'local $/; my $d = eval { JSON::PP->new->decode(scalar <STDIN>) } or exit 1;
+    $d = $d->[0] if ref $d eq "ARRAY"; exit 1 unless ref $d eq "HASH";
+    print "$_->{vmid}\n" for grep { ref eq "HASH" && defined $_->{vmid} } @{ $d->{members} // [] }' <<<"$j"
+}
+
+# resolve_guests SPEC EXCLUDE SKIP_TEMPLATES: "vmid|type|name" for the guests on this node.
+# Notes about skipped guests go to stderr.
+resolve_guests() {
+  local spec="$1" excl skip_tpl="${3:-0}" all wanted=() id line t name tpl pm
+  excl=" $(expand_ids "${2:-}" | paste -sd' ' -) "
+  all="$(local_guests)"
+  case "$spec" in
+    all) mapfile -t wanted < <(cut -d'|' -f1 <<<"$all") ;;
+    pool:*) pm="$(pool_members "${spec#pool:}")" || { echo "Pool ${spec#pool:} not found" >&2; return 1; }
+            mapfile -t wanted <<<"$pm" ;;
+    *) mapfile -t wanted < <(expand_ids "$spec") ;;
+  esac
+  for id in "${wanted[@]}"; do
+    [[ -n "$id" ]] || continue
+    [[ "$excl" == *" $id "* ]] && continue
+    line="$(awk -F'|' -v i="$id" '$1==i{print; exit}' <<<"$all")"
+    if [[ -z "$line" ]]; then
+      [[ "$spec" == pool:* ]] || echo "guest $id is not on node $NODE, skipped" >&2
+      continue
+    fi
+    IFS='|' read -r _ t name tpl <<<"$line"
+    if (( skip_tpl )) && [[ "$tpl" == 1 ]]; then
+      [[ "$spec" == all || "$spec" == pool:* ]] || echo "guest $id is a template (no snapshots), skipped" >&2
+      continue
+    fi
+    echo "$id|$t|$name"
+  done
+}
+
+# storage_type STORAGE: type from storage.cfg (dir, zfspool, lvmthin, lvm, pbs, ...)
+storage_type() { awk -v s="$1" '/^[a-z]+: /{t=$1; sub(/:$/, "", t); if ($2 == s) {print t; exit}}' "$PVE_DIR/storage.cfg" 2>/dev/null || true; }
+storage_cfg()  { awk -v s="$1" -v k="$2" '/^[a-z]+: /{cur=$2; next} cur==s && $1==k {print $2; exit}' "$PVE_DIR/storage.cfg" 2>/dev/null || true; }
+
+# guest_volumes CONF: "storage:volume" of each disk in the current config (no CD-ROMs, bind mounts)
+guest_volumes() {
+  awk '/^\[/{exit}
+       $1 ~ /^(ide|sata|scsi|virtio|efidisk|tpmstate|rootfs|mp)[0-9]*:$/ && $0 !~ /media=cdrom/ {
+         v = $2; sub(/,.*/, "", v); if (v ~ /^[A-Za-z][A-Za-z0-9_.-]*:/) print v }' "$1" 2>/dev/null || true
+}
+guest_storages() { guest_volumes "$1" | cut -d: -f1 | sort -u; }
+
+# snap_capable CONF: prints "yes", or "no: <volume> (<type>)" for the first disk that cannot be
+# snapshotted. Offline guess from the storage types; the API check at run time decides.
+snap_capable() {
+  local vol st type
+  while IFS= read -r vol; do
+    st="${vol%%:*}"; type="$(storage_type "$st")"
+    case "$type" in
+      zfspool|lvmthin|rbd|btrfs|zfs) ;;
+      dir|nfs|cifs|glusterfs|cephfs) [[ "$vol" == *.qcow2 ]] || { echo "no: $vol is not qcow2"; return 0; } ;;
+      "") ;;
+      *) echo "no: $vol is on $type storage"; return 0 ;;
+    esac
+  done < <(guest_volumes "$1")
+  echo yes
+}
+
+# snap_supported VMID TYPE: Proxmox API check. 0 yes, 1 no, 2 unknown
+snap_supported() {
+  local j; j="$(pvesh get "/nodes/$NODE/$2/$1/feature" --feature snapshot --output-format json 2>/dev/null)" || return 2
+  [[ "$(jrows hasFeature <<<"$j")" == 1 ]] || return 1
+}
+
+backup_storages() { pvesm status --content backup 2>/dev/null | awk 'NR>1{print $1}' || true; }
+is_backup_storage() { [[ $'\n'"$(backup_storages)"$'\n' == *$'\n'"$1"$'\n'* ]]; }
+
+# storage_room STORAGE MAXPCT: fails with the reason when the storage is inactive or too full
+storage_room() {
+  local st="$1" max="$2" line type status total used pct meta vg pool
+  line="$(pvesm status --storage "$st" 2>/dev/null | awk 'NR==2')" || true
+  [[ -n "$line" ]] || { echo "storage $st not found"; return 1; }
+  read -r _ type status total used _ <<<"$line"
+  [[ "$status" == active ]] || { echo "storage $st is $status"; return 1; }
+  pct=0; [[ "$total" =~ ^[0-9]+$ && "$used" =~ ^[0-9]+$ ]] && (( total > 0 )) && pct=$(( used * 100 / total ))
+  (( pct < max )) || { echo "storage $st is $pct% full (limit $max%)"; return 1; }
+  if [[ "$type" == lvmthin ]]; then
+    vg="$(storage_cfg "$st" vgname)" pool="$(storage_cfg "$st" thinpool)"
+    meta="$(lvs --noheadings -o metadata_percent "$vg/$pool" 2>/dev/null | awk '{print int($1)}')" || true
+    (( ${meta:-0} < max )) || { echo "thin pool $vg/$pool metadata is $meta% full (limit $max%)"; return 1; }
+  fi
+  return 0
+}
+
+# conf_snapshots CONF: "snaptime name snapstate" per snapshot section, oldest first
+conf_snapshots() {
+  awk '/^\[/ { if (n != "") print t + 0, n, s; n = substr($0, 2, length($0) - 2); t = 0; s = ""; if (n ~ /^(PENDING|special:)/) n = ""; next }
+       n != "" && $1 == "snaptime:" { t = $2 }
+       n != "" && $1 == "snapstate:" { s = $2 }
+       END { if (n != "") print t + 0, n, s }' "$1" 2>/dev/null | sort -n
+}
+job_snap_re() { echo "^ptb_${1}_[0-9]{8}_[0-9]{6}\$"; }
+snap_name()   { echo "ptb_${J[NAME]}_$(date +%Y%m%d_%H%M%S)"; }
+
+quorate() {
+  is_cluster || return 0
+  [[ "$(pvesh get /cluster/status --output-format json 2>/dev/null | jrows type quorate | awk -F'|' '$1=="cluster"{print $2}')" == 1 ]]
+}
+
+# ---- running a job ------------------------------------------------------------------
+# job_cleanup: after an interrupted run, unlock guests it left locked and remove its
+# half-made snapshots. Skipped for a guest while a backup or snapshot process still runs.
+job_cleanup() {
+  local id t name conf lock cmd snaps re sn state
+  re="$(job_snap_re "${J[NAME]}")"
+  while IFS='|' read -r id t name; do
+    [[ -n "$id" ]] || continue
+    conf="$(guest_conf_path "$id" "$t")"; [[ "$t" == lxc ]] && cmd=pct || cmd=qm
+    lock="$(awk '/^\[/{exit} $1=="lock:"{print $2}' "$conf" 2>/dev/null || true)"
+    case "$lock" in
+      backup)
+        if pgrep -f vzdump >/dev/null 2>&1; then jlog "  $id: locked (backup) and a vzdump is running; left alone"
+        else jlog "  $id: removing stale backup lock"; jrun "$cmd" unlock "$id" || true; fi ;;
+      snapshot|snapshot-delete)
+        if pgrep -f "(snapshot|delsnapshot):$id:|(qm|pct) (snapshot|delsnapshot) $id( |\$)" >/dev/null 2>&1; then
+          jlog "  $id: locked ($lock) by a running snapshot task; left alone"
+        else jlog "  $id: removing stale $lock lock"; jrun "$cmd" unlock "$id" || true; fi ;;
+    esac
+    snaps="$(conf_snapshots "$conf")"
+    while read -r _ sn state; do
+      [[ -n "${sn:-}" && -n "${state:-}" && "$sn" =~ $re ]] || continue
+      jlog "  $id: removing half-made snapshot $sn ($state)"
+      jrun "$cmd" delsnapshot "$id" "$sn" --force 1 || true
+    done <<<"$snaps"
+    if [[ -n "$lock" && "$(awk '/^\[/{exit} $1=="onboot:"{print $2}' "$conf" 2>/dev/null)" == 1 ]] \
+       && ! "$cmd" status "$id" 2>/dev/null | grep -q running; then
+      jlog "  $id: has onboot=1 but is stopped (it was locked at boot). Start it: $cmd start $id"
+    fi
+  done < <(resolve_guests "${J[GUESTS]}" "${J[EXCLUDE]}" 0 2>/dev/null || true)
+}
+
+# snap_prune ID TYPE CONF: deletes this job's oldest snapshots beyond KEEP
+snap_prune() {
+  local id="$1" t="$2" conf="$3" keep="${J[KEEP]}" names=() sn state cmd re n i pfail=0
+  [[ "$t" == lxc ]] && cmd=pct || cmd=qm
+  re="$(job_snap_re "${J[NAME]}")"
+  while read -r _ sn state; do
+    [[ -n "${sn:-}" && "$sn" =~ $re ]] || continue
+    if [[ -n "${state:-}" ]]; then jlog "  $id: snapshot $sn is in state '$state'; not counted, not deleted"; continue; fi
+    names+=("$sn")
+  done < <(conf_snapshots "$conf")
+  (( DRY_RUN )) && keep=$(( keep - 1 ))   # the new snapshot does not exist in a dry run
+  n=$(( ${#names[@]} - keep ))
+  for (( i = 0; i < n; i++ )); do
+    jrun "$cmd" delsnapshot "$id" "${names[i]}" || { jlog "  $id: could not delete ${names[i]}; kept"; pfail=1; }
+  done
+  return "$pfail"
+}
+
+# snap_guest ID TYPE NAME: 0 ok, 1 failed, 2 ok but pruning failed, 3 skipped (no snapshot
+# support, guest picked by "all" or a pool; a guest listed by ID fails instead)
+snap_guest() {
+  local id="$1" t="$2" gname="$3" conf cmd st reason attempt snap sup=0 args why
+  conf="$(guest_conf_path "$id" "$t")"; [[ "$t" == lxc ]] && cmd=pct || cmd=qm
+  snap_supported "$id" "$t" || sup=$?
+  if (( sup == 1 )); then
+    why="$(snap_capable "$conf" | sed 's/^no: //; s/^yes$/its storage does not support snapshots/')"
+    if [[ "${J[GUESTS]}" == all || "${J[GUESTS]}" == pool:* ]]; then
+      jlog "SKIP $id ${gname:+($gname)}: $why - cannot be snapshotted; back it up with a backup job"
+      return 3
+    fi
+    jlog "FAILED $id ${gname:+($gname)}: $why - this guest cannot be snapshotted; use a backup job for it"
+    return 1
+  fi
+  for st in $(guest_storages "$conf"); do
+    reason="$(storage_room "$st" "${J[MAX_USED]}")" || { jlog "FAILED $id ${gname:+($gname)}: $reason; no snapshot taken"; return 1; }
+  done
+  for (( attempt = 1; attempt <= SCHED_ATTEMPTS; attempt++ )); do
+    snap="$(snap_name)"
+    args=("$cmd" snapshot "$id" "$snap" --description "proxmox-toolbelt job ${J[NAME]}")
+    [[ "$t" == qemu && "${J[VMSTATE]}" == 1 ]] && args+=(--vmstate 1)
+    if jrun "${args[@]}"; then
+      jlog "OK $id ${gname:+($gname)}: $snap"
+      snap_prune "$id" "$t" "$conf" || return 2
+      return 0
+    fi
+    if (( attempt < SCHED_ATTEMPTS )); then jlog "  $id: try $attempt failed; next try in ${SCHED_RETRY_WAIT}s"; sleep "$SCHED_RETRY_WAIT"; fi
+  done
+  jlog "FAILED $id ${gname:+($gname)}: snapshot failed $SCHED_ATTEMPTS times"
+  return 1
+}
+
+# run_snapshots: snapshot each guest; prints the summary on fd 3. 0 ok, 1 failed, 2 warnings
+run_snapshots() {
+  local guests id t name ok=0 failed=() warned=() skipped=() rc
+  guests="$(resolve_guests "${J[GUESTS]}" "${J[EXCLUDE]}" 1 2>"$JOB_TMP/notes")" || { log_notes; echo "guest list failed" >&3; return 1; }
+  log_notes
+  if [[ -z "$guests" ]]; then jlog "No guests on $NODE match '${J[GUESTS]}'"; echo "no guests" >&3; return 2; fi
+  while IFS='|' read -r id t name; do
+    rc=0; snap_guest "$id" "$t" "$name" || rc=$?
+    case "$rc" in 0) ok=$(( ok + 1 )) ;; 2) ok=$(( ok + 1 )); warned+=("$id") ;; 3) skipped+=("$id") ;; *) failed+=("$id") ;; esac
+  done <<<"$guests"
+  echo "$ok snapshot(s)${failed[*]:+, failed: ${failed[*]}}${warned[*]:+, pruning failed: ${warned[*]}}${skipped[*]:+, skipped (no snapshot support): ${skipped[*]}}" >&3
+  if (( ${#failed[@]} )); then return 1; elif (( ${#warned[@]} )); then return 2; fi
+  return 0
+}
+
+# run_backup: one vzdump run; failed guests are tried again. 0 ok, 1 failed, 2 warnings
+run_backup() {
+  local st="${J[STORAGE]}" reason guests ids=() id attempt out failed=() type args
+  reason="$(storage_room "$st" "${J[MAX_USED]}")" || { jlog "FAILED: $reason; no backup started"; echo "$reason" >&3; return 1; }
+  if ! is_backup_storage "$st"; then
+    jlog "FAILED: storage $st does not allow backups (content 'VZDump backup file')"; echo "storage $st has no backup content" >&3; return 1
+  fi
+  guests="$(resolve_guests "${J[GUESTS]}" "${J[EXCLUDE]}" 0 2>"$JOB_TMP/notes")" || { log_notes; echo "guest list failed" >&3; return 1; }
+  log_notes
+  mapfile -t ids < <(cut -d'|' -f1 <<<"$guests" | grep .)
+  if (( ${#ids[@]} == 0 )); then jlog "No guests on $NODE match '${J[GUESTS]}'"; echo "no guests" >&3; return 2; fi
+  type="$(storage_type "$st")"
+  out="$JOB_TMP/vzdump.out"
+  for (( attempt = 1; attempt <= SCHED_ATTEMPTS; attempt++ )); do
+    args=(vzdump "${ids[@]}" --storage "$st" --mode "${J[MODE]}"
+          --prune-backups "${J[RETENTION]:-keep-last=${J[KEEP]}}"
+          --notes-template "{{guestname}} (proxmox-toolbelt job ${J[NAME]})")
+    [[ "$type" == pbs ]] || args+=(--compress "${J[COMPRESS]}")
+    if JRUN_OUT="$out" jrun "${args[@]}"; then
+      echo "${#ids[@]} guest(s) backed up to $st$( (( attempt > 1 )) && echo " (after $attempt tries)")" >&3
+      return 0
+    fi
+    mapfile -t failed < <(grep -oE 'Backup of VM [0-9]+ failed' "$out" 2>/dev/null | grep -oE '[0-9]+' | sort -un)
+    (( ${#failed[@]} )) && ids=("${failed[@]}")
+    if (( attempt < SCHED_ATTEMPTS )); then jlog "  try $attempt failed${failed[*]:+ for ${failed[*]}}; next try in ${SCHED_RETRY_WAIT}s"; sleep "$SCHED_RETRY_WAIT"; fi
+  done
+  echo "backup failed for ${ids[*]}" >&3
+  return 1
+}
+
+job_notify() { # NAME STATUS SUMMARY
+  local mode="${J[NOTIFY]}" sm
+  [[ "$mode" == never ]] && return 0
+  [[ "$mode" == always || "$2" != ok ]] || return 0
+  if command -v sendmail >/dev/null; then sm=sendmail
+  elif [[ -x /usr/sbin/sendmail ]]; then sm=/usr/sbin/sendmail
+  else jlog "no sendmail; notification not sent"; return 0; fi
+  {
+    printf 'To: root\nSubject: [%s] %s job %s: %s\n\n' "$NODE" "${J[TYPE]}" "$1" "$2"
+    printf '%s\n\nLog: %s\nLast lines:\n\n' "$3" "$JLOG"
+    tail -n 60 "$JLOG" 2>/dev/null
+  } | "$sm" -i root 2>/dev/null || jlog "could not send the notification mail"
+}
+
+job_locked() { ! flock -n "$1" true 2>/dev/null; }
+
+# job_exec NAME SLOT MANUAL: one run under the job lock. Sets JOB_RESULT (ok, warning, failed,
+# busy, dry-run). Called as a plain command: under "if" or "||" bash ignores set -e in the run.
+JOB_RESULT="" JOB_TMP=""
+job_exec() {
+  local name="$1" slot="$2" manual="${3:-0}" lockf fd start end rc st summary sf
+  JOB_RESULT=""
+  job_load "$name" || exit 1
+  JOB_TMP="$(mktemp -d)"; TMP_DIRS+=("$JOB_TMP")
+  if (( DRY_RUN )); then
+    JLOG=""
+    jlog "[dry-run] ${J[TYPE]} job $name ($(schedule_text)), guests ${J[GUESTS]}${J[EXCLUDE]:+ except ${J[EXCLUDE]}}"
+    sf="$JOB_TMP/summary"
+    if [[ "${J[TYPE]}" == snapshot ]]; then run_snapshots 3>"$sf" || true; else run_backup 3>"$sf" || true; fi
+    jlog "[dry-run] result: $(cat "$sf")"
+    JOB_RESULT=dry-run
+    return 0
+  fi
+  mkdir -p "$SCHED_LOG" "$SCHED_STATE" "$SCHED_LOCKS"
+  JLOG="$SCHED_LOG/$name.log"
+  lockf="$SCHED_LOCKS/$JOB_UNIT-$name.lock"
+  exec {fd}>>"$lockf"
+  if ! flock -n "$fd"; then
+    jlog "Job $name is already running (lock $lockf); this start is skipped"
+    exec {fd}>&-
+    JOB_RESULT=busy
+    return 0
+  fi
+  if [[ "$(state_get "$name" status)" == running ]]; then
+    jlog "WARN: the run started $(fmt_ts "$(state_get "$name" last_start)") did not finish (reboot, crash or kill). Cleaning up, then running again."
+    job_cleanup
+  fi
+  start="$(date +%s)"
+  state_set "$name" status=running "last_start=$start"
+  jlog "=== ${J[TYPE]} job $name started$( (( manual )) && echo " by hand"): $(schedule_text), guests ${J[GUESTS]}${J[EXCLUDE]:+ except ${J[EXCLUDE]}}, keep ${J[RETENTION]:-${J[KEEP]}}"
+  sf="$JOB_TMP/summary"; : >"$sf"
+  if ! quorate; then
+    jlog "FAILED: the cluster is not quorate (/etc/pve is read-only)"; echo "cluster not quorate" >"$sf"; rc=1
+  else
+    set +e
+    ( set -e; if [[ "${J[TYPE]}" == snapshot ]]; then run_snapshots; else run_backup; fi ) 3>"$sf"
+    rc=$?
+    set -e
+  fi
+  end="$(date +%s)"
+  summary="$(tr '\n' ' ' <"$sf" | sed 's/ *$//')"
+  case "$rc" in
+    0) st=ok ;; 2) st=warning ;;
+    *) st=failed; [[ -n "$summary" ]] || summary="stopped with exit code $rc" ;;
+  esac
+  local upd=(status="$st" "last_end=$end" "last_rc=$rc" "message=$summary" "duration=$(( end - start ))")
+  (( manual )) || upd+=("last_slot=$slot")
+  if [[ "$st" == failed ]]; then upd+=("fails=$(( $(state_get "$name" fails || echo 0) + 1 ))"); else upd+=("last_ok=$end" "fails=0"); fi
+  state_set "$name" "${upd[@]}"
+  jlog "=== job $name: $st in $(( end - start ))s: $summary"
+  job_notify "$name" "$st" "$summary"
+  log_trim "$JLOG"
+  exec {fd}>&-
+  JOB_RESULT="$st"
+  return 0
+}
+
+# job_tick NAME: timer entry point; runs the job when it is due
+job_tick() {
+  local name="$1" min mon tick cal now slot last st
+  JOB_RESULT=""
+  job_load "$name" || exit 1
+  if [[ -n "${J[CALENDAR]}" ]]; then job_exec "$name" "$(sched_now)" 0; return 0; fi
+  read -r min mon <<<"$(parse_every "${J[EVERY]}")"
+  IFS='|' read -r tick cal <<<"$(sched_tick "$min" "$mon" "${J[AT]}")"
+  now="$(sched_now)"; slot="$(sched_slot "$now" "$tick" "${J[AT]}")"
+  last="$(state_get "$name" last_slot)"; st="$(state_get "$name" status)"
+  if [[ "$st" != running ]] && ! sched_due "$slot" "$last" "$min" "$mon" "$tick"; then JOB_RESULT=not-due; return 0; fi
+  job_exec "$name" "$slot" 0
+}
+
+# sched_recover: at boot, starts every job whose last run was cut short
+sched_recover() {
+  local name
+  while IFS= read -r name; do
+    [[ "$(state_get "$name" status)" == running ]] || continue
+    job_locked "$SCHED_LOCKS/$JOB_UNIT-$name.lock" && continue
+    echo "Job $name was interrupted at $(fmt_ts "$(state_get "$name" last_start)"); starting it again"
+    systemctl start --no-block "$JOB_UNIT@$name.service" || echo "Could not start $JOB_UNIT@$name.service" >&2
+  done < <(job_names)
+}
+
+# ---- systemd units -------------------------------------------------------------------
+unit_service() {
+  cat <<EOF
+# Written by proxmox-toolbelt. Runs one scheduled snapshot or backup job.
+[Unit]
+Description=proxmox-toolbelt scheduled job %i
+Documentation=https://github.com/cfunkz/Proxmox-Toolbelt
+After=pve-cluster.service pve-guests.service pvestatd.service network-online.target remote-fs.target
+ConditionPathExists=$SCHED_DIR/%i.conf
+ConditionPathExists=|${SCHED_PROGS[0]}
+ConditionPathExists=|${SCHED_PROGS[1]}
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/env proxmox-toolbelt schedule tick %i
+Nice=10
+TimeoutStopSec=10min
+EOF
+}
+
+unit_recover() {
+  cat <<EOF
+# Written by proxmox-toolbelt. Restarts scheduled jobs that a reboot or crash interrupted.
+[Unit]
+Description=proxmox-toolbelt: resume interrupted scheduled jobs
+After=pve-cluster.service pve-guests.service pvestatd.service network-online.target remote-fs.target
+ConditionDirectoryNotEmpty=$SCHED_DIR
+ConditionPathExists=|${SCHED_PROGS[0]}
+ConditionPathExists=|${SCHED_PROGS[1]}
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/env proxmox-toolbelt schedule recover
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+unit_timer() { # J loaded
+  local cal min mon
+  if [[ -n "${J[CALENDAR]}" ]]; then cal="${J[CALENDAR]}"
+  else read -r min mon <<<"$(parse_every "${J[EVERY]}")"; cal="$(sched_tick "$min" "$mon" "${J[AT]}")"; cal="${cal#*|}"; fi
+  cat <<EOF
+# Written by proxmox-toolbelt. Job settings: $(job_file "${J[NAME]}")
+# The timer ticks on this grid; each tick runs the job only when it is due ($(schedule_text)).
+[Unit]
+Description=proxmox-toolbelt ${J[TYPE]} job ${J[NAME]}: $(schedule_text)
+
+[Timer]
+OnCalendar=$cal
+Persistent=true
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target
+EOF
+}
+
+# sched_put PATH MODE < content: atomic write (dry run: shows the content)
+sched_put() {
+  local p="$1" m="$2" t
+  if (( DRY_RUN )); then echo "${C_D}[dry-run] would write $p:${C_0}"; sed 's/^/    /'; return 0; fi
+  mkdir -p "$(dirname "$p")"
+  t="$(mktemp "$p.XXXXXX")"; cat >"$t"; chmod "$m" "$t"; mv -f "$t" "$p"
+  log "Wrote $p"
+}
+
+# sched_prog: the installed proxmox-toolbelt that the timers run
+sched_prog() { local p; for p in "${SCHED_PROGS[@]}"; do [[ -x "$p" ]] && { echo "$p"; return 0; }; done; return 1; }
+sched_require_prog() {
+  local p
+  if p="$(sched_prog)"; then
+    grep -q 'schedule tick' "$p" 2>/dev/null && return 0
+    warn "$p is an older proxmox-toolbelt without scheduled jobs; the timers would fail."
+  else
+    warn "The timers need proxmox-toolbelt installed as ${SCHED_PROGS[1]} (package) or ${SCHED_PROGS[0]}."
+  fi
+  if [[ -t 0 && -z "$(pkg_version)" ]]; then fix_install; sched_prog >/dev/null && grep -q 'schedule tick' "$(sched_prog)" && return 0; fi
+  (( DRY_RUN )) && return 0
+  die "Install or update proxmox-toolbelt first (menu 8.2 or the .deb package)"
+}
+
+# job_install: writes the job file and units, enables the timer (J filled and checked)
+job_install() {
+  local name="${J[NAME]}"
+  job_render | sched_put "$(job_file "$name")" 644
+  unit_service | sched_put "$UNIT_DIR/$JOB_UNIT@.service" 644
+  unit_recover | sched_put "$UNIT_DIR/$RECOVER_UNIT" 644
+  unit_timer | sched_put "$UNIT_DIR/$JOB_UNIT@$name.timer" 644
+  run systemctl daemon-reload
+  run systemctl enable --now "$JOB_UNIT@$name.timer"
+  run systemctl enable "$RECOVER_UNIT"
+}
+
+# job_remove NAME: timer, job file and state; the log and the snapshots/backups stay
+run_soft() { if (( DRY_RUN )); then run "$@"; else "$@" || warn "Command failed: $*"; fi; }
+job_remove() {
+  local name="$1"
+  run_soft systemctl disable --now "$JOB_UNIT@$name.timer"
+  run rm -f "$UNIT_DIR/$JOB_UNIT@$name.timer" "$(job_file "$name")" "$(state_file "$name")"
+  if [[ -z "$(job_names | grep -vx "$name" || true)" ]]; then
+    run_soft systemctl disable "$RECOVER_UNIT"
+    run rm -f "$UNIT_DIR/$RECOVER_UNIT" "$UNIT_DIR/$JOB_UNIT@.service"
+  fi
+  run systemctl daemon-reload
+}
+
+# ---- views and wizards ------------------------------------------------------------------
+view_schedules() {
+  hdr "Scheduled snapshots and backups on $NODE"
+  local names name st when
+  names="$(job_names)"
+  if [[ -z "$names" ]]; then
+    hint "No jobs yet. Add one with 5.4 (snapshots) or 5.5 (backups)."
+    return 0
+  fi
+  printf '  %-16s %-8s %-28s %-14s %-12s %-16s %-8s %s\n' JOB TYPE SCHEDULE GUESTS KEEP "LAST RUN" RESULT NEXT
+  while IFS= read -r name; do
+    if ! job_load "$name" 2>/dev/null; then printf '  %-16s %s\n' "$name" "${C_R}invalid job file $(job_file "$name")${C_0}"; continue; fi
+    st="$(state_get "$name" status)"
+    local col="$C_G"; case "$st" in failed) col="$C_R" ;; warning|running) col="$C_Y" ;; "") col="$C_D"; st=never ;; esac
+    when="$(next_due_text "$name")"
+    printf '  %-16s %-8s %-28.28s %-14.14s %-12.12s %-16s %s%-8s%s %s\n' "$name" "${J[TYPE]}" "$(schedule_text)" \
+      "${J[GUESTS]}${J[EXCLUDE]:+ -${J[EXCLUDE]}}" "${J[RETENTION]:-${J[KEEP]}}" "$(fmt_ts "$(state_get "$name" last_start)")" \
+      "$col" "$st" "$C_0" "$when"
+    local msg; msg="$(state_get "$name" message)"
+    [[ -n "$msg" ]] && printf '  %s%-16s %s%s\n' "$C_D" "" "$msg" "$C_0"
+  done <<<"$names"
+  echo
+  hint "Timers: systemctl list-timers '$JOB_UNIT@*'   Logs: $SCHED_LOG/<job>.log"
+  hint "Snapshots are named ptb_<job>_<date>_<time> and show in the guest's Snapshots tab."
+}
+
+job_status() {
+  local name="$1"
+  job_load "$name" || return 1
+  hdr "Job $name"
+  job_render | grep -v '^#' | sed 's/^/  /'
+  echo
+  local k
+  for k in status last_start last_end duration message last_ok fails; do
+    local v; v="$(state_get "$name" "$k")"
+    [[ "$k" =~ ^last_(start|end|ok)$ ]] && v="$(fmt_ts "$v")"
+    printf '  %-11s %s\n' "$k" "${v:--}"
+  done
+  printf '  %-11s %s\n' timer "$(systemctl is-enabled "$JOB_UNIT@$name.timer" 2>/dev/null || echo missing), $(systemctl is-active "$JOB_UNIT@$name.timer" 2>/dev/null || true)"
+  printf '  %-11s %s\n' next "$(next_due_text "$name")"
+  echo; echo "${C_B}Last log lines${C_0} ($SCHED_LOG/$name.log)"
+  tail -n 15 "$SCHED_LOG/$name.log" 2>/dev/null | sed 's/^/  /' || hint "no runs yet"
+}
+
+add_snapshot_job() { sched_wizard snapshot; }
+add_backup_job()   { sched_wizard backup; }
+
+sched_wizard() {
+  local type="$1" id t name tpl conf n=0 sup
+  need_root
+  sched_require_prog
+  hdr "New scheduled $type job"
+  if [[ "$type" == snapshot ]]; then
+    hint "Proxmox snapshots: ZFS snapshots on ZFS, thin snapshots on LVM-thin, qcow2 snapshots on"
+    hint "directory/NFS storage. Plain LVM and raw disk files cannot be snapshotted: use a backup job."
+    hint "A snapshot lives on the same disks as the guest. It is not a backup."
+  else
+    hint "vzdump backups to a backup storage (directory, NFS, CIFS or Proxmox Backup Server)."
+    hint "Works for guests on any storage, including ZFS and plain LVM."
+  fi
+  echo
+  printf '  %-6s %-3s %-24s %s\n' ID T NAME "$([[ $type == snapshot ]] && echo SNAPSHOTS || echo DISKS)"
+  while IFS='|' read -r id t name tpl; do
+    [[ -n "$id" ]] || continue
+    n=$(( n + 1 )); conf="$(guest_conf_path "$id" "$t")"
+    if [[ "$type" == snapshot ]]; then
+      if [[ "$tpl" == 1 ]]; then sup="${C_D}template, skipped${C_0}"
+      else sup="$(snap_capable "$conf")"; [[ "$sup" == yes ]] && sup="${C_G}yes${C_0}" || sup="${C_Y}$sup${C_0}"; fi
+    else sup="$(guest_storages "$conf" | paste -sd, -)"; fi
+    printf '  %-6s %-3s %-24.24s %s\n' "$id" "$([[ $t == lxc ]] && echo CT || echo VM)" "${name:--}" "$sup"
+  done < <(local_guests)
+  (( n )) || die "No VMs or containers on $NODE"
+  echo
+  job_defaults ""
+  J[TYPE]="$type"
+  local g ex resolved
+  while true; do
+    ask g "Guests: all, pool:NAME, or IDs such as 100,101,200-210" all v_guests
+    ex=""
+    [[ "$g" == all || "$g" == pool:* ]] && ask ex "Leave out (IDs, blank for none)" none v_idlist
+    [[ "$ex" == none ]] && ex=""
+    resolved="$(resolve_guests "$g" "$ex" "$([[ $type == snapshot ]] && echo 1 || echo 0)")" || continue
+    [[ -n "$resolved" ]] && break
+    echo "  No guest on $NODE matches" >&2
+  done
+  J[GUESTS]="$g" J[EXCLUDE]="$ex"
+  if [[ "$type" == snapshot ]]; then
+    local nos=() c
+    while IFS='|' read -r id t _; do
+      c="$(snap_capable "$(guest_conf_path "$id" "$t")")"; [[ "$c" == yes ]] || nos+=("$id")
+    done <<<"$resolved"
+    if (( ${#nos[@]} )); then
+      if [[ "$g" == all || "$g" == pool:* ]]; then warn "No snapshot support for ${nos[*]}: these are skipped (cover them with a backup job)."
+      else warn "No snapshot support for ${nos[*]}: each run will report them as failed. Use a backup job for them."; fi
+    fi
+  fi
+  log "Guests now: $(cut -d'|' -f1 <<<"$resolved" | paste -sd' ' -)$([[ $g == all || $g == pool:* ]] && echo " (guests added later are included)")"
+
+  echo
+  hint "Interval: 10m 30m 1h 6h 10h 24h 1d 1w 1mo, or combinations such as 1h30m (m = minutes, mo = months)."
+  hint "Or a systemd calendar: cal:Mon..Fri 22:00, cal:*-*-01 03:00 (see: man systemd.time)."
+  local every min mon
+  ask every "Run every" "$([[ $type == snapshot ]] && echo 1h || echo 1d)" v_every
+  if [[ "$every" == cal:* ]]; then
+    J[CALENDAR]="${every#cal:}"
+  else
+    J[EVERY]="${every,,}"
+    read -r min mon <<<"$(parse_every "$every")"
+    if (( mon || min % 1440 == 0 )); then
+      ask "J[AT]" "At (HH:MM)" "$([[ $type == snapshot ]] && echo 01:00 || echo 02:00)" v_at
+      (( mon )) && hint "Month intervals run on the 1st of the month; the first run is at the next ${J[AT]}."
+    fi
+  fi
+
+  echo
+  local kdef=7
+  if [[ "$type" == snapshot && -z "${J[CALENDAR]}" ]]; then
+    if (( mon )); then kdef=3; elif (( min < 1440 )); then kdef=24; elif (( min % 10080 == 0 )); then kdef=4; fi
+  fi
+  ask "J[KEEP]" "Keep how many ${type}s per guest (oldest are deleted)" "$kdef" v_keep
+  if [[ "$type" == backup ]]; then
+    hint "Instead of keep-last, Proxmox retention rules can be used, e.g. keep-daily=7,keep-weekly=4,keep-monthly=6."
+    hint "Retention counts every backup of a guest on that storage, also those made by other jobs or by hand."
+    ask "J[RETENTION]" "Retention rules (blank = keep-last=${J[KEEP]})" none v_retention
+    [[ "${J[RETENTION]}" == none ]] && J[RETENTION]=""
+
+    local opts=() s ty stt tot used avail def=""
+    while read -r s ty stt tot used avail _; do
+      [[ -n "$s" ]] || continue
+      opts+=("$s|$ty, $stt, $(human_gib "${avail:-0}") free"); [[ -z "$def" || "$ty" == pbs ]] && def="$s"
+    done < <(pvesm status --content backup 2>/dev/null | awk 'NR>1')
+    (( ${#opts[@]} )) || die "No storage allows backups. Add one: Datacenter > Storage > Add (Directory, NFS, PBS) with content 'VZDump backup file'."
+    menu "J[STORAGE]" "Backup storage" "$def" "${opts[@]}"
+    menu "J[MODE]" "Backup mode" snapshot "snapshot|no downtime (recommended)" "suspend|short pause of the guest" "stop|guest is shut down during the backup"
+    [[ "$(storage_type "${J[STORAGE]}")" == pbs ]] || menu "J[COMPRESS]" "Compression" zstd "zstd|fast, good ratio" "gzip|" "lzo|" "0|none"
+  else
+    ask_yn "Include VM RAM in snapshots (vmstate: slower, uses as much space as the RAM)?" n && J[VMSTATE]=1
+  fi
+  ask "J[MAX_USED]" "Skip the run when the storage is at least this full (%)" 90 v_pct
+  menu "J[NOTIFY]" "Mail root@pam when" failure "failure|the run fails or partly fails" "always|after every run" "never|no mail"
+
+  local defname; defname="$([[ $type == snapshot ]] && echo snap || echo backup)_$(tr -c 'a-z0-9\n' '_' <<<"${J[EVERY]:-cal}" | tr -s _ | sed 's/_$//')"
+  v_newjob "$defname" 2>/dev/null || defname="${defname}_2"
+  ask "J[NAME]" "Job name" "$defname" v_newjob
+  job_check_all || die "Invalid settings"
+
+  hdr "Summary"
+  job_render | grep -v '^#' | sed 's/^/  /'
+  echo
+  hint "Runs $(schedule_text); missed runs (node off) run right after boot; interrupted runs run again."
+  [[ "$type" == snapshot ]] && hint "Snapshot names: ptb_${J[NAME]}_YYYYMMDD_HHMMSS. Only these are pruned; other snapshots are never touched."
+  hint "Files: $(job_file "${J[NAME]}"), $UNIT_DIR/$JOB_UNIT@${J[NAME]}.timer"
+  confirm "Create job ${J[NAME]}?" || return 0
+  job_install
+  (( DRY_RUN )) && return 0
+  log "Job ${J[NAME]} created. Next: $(next_due_text "${J[NAME]}")"
+  ask_yn "Run it once now to test it (the output is also logged)?" y || return 0
+  job_exec "${J[NAME]}" "" 1
+}
+
+manage_jobs() {
+  need_root
+  local names opts=() name
+  view_schedules
+  names="$(job_names)"
+  [[ -n "$names" ]] || return 0
+  while IFS= read -r name; do opts+=("$name"); done <<<"$names"
+  echo
+  menu name "Job" "${opts[0]}" "${opts[@]}"
+  local on=0 act; systemctl is-enabled --quiet "$JOB_UNIT@$name.timer" 2>/dev/null && on=1
+  menu act "Action" status "status|settings, last run and log" "run|run it now" "test|dry run: show what it would do" \
+    "$( (( on )) && echo "pause|stop the timer" || echo "resume|start the timer")" "remove|delete the job (snapshots and backups stay)"
+  case "$act" in
+    status) job_status "$name" ;;
+    run) job_exec "$name" "" 1 ;;
+    test) DRY_RUN=1 job_exec "$name" "" 1 ;;
+    pause) run systemctl disable --now "$JOB_UNIT@$name.timer" ;;
+    resume) run systemctl enable --now "$JOB_UNIT@$name.timer" ;;
+    remove)
+      job_load "$name" || true
+      local snaps=() id t re sn state
+      if [[ "${J[TYPE]:-}" == snapshot ]]; then
+        re="$(job_snap_re "$name")"
+        while IFS="|" read -r id t _; do
+          while read -r _ sn state; do [[ -n "${sn:-}" && "$sn" =~ $re ]] && snaps+=("$id|$t|$sn"); done < <(conf_snapshots "$(guest_conf_path "$id" "$t")")
+        done < <(resolve_guests all "" 0 2>/dev/null)
+      fi
+      confirm "Remove job $name?" || return 0
+      job_remove "$name"
+      if (( ${#snaps[@]} )) && confirm "Also delete the ${#snaps[@]} snapshot(s) this job made?"; then
+        local s; for s in "${snaps[@]}"; do IFS='|' read -r id t sn <<<"$s"; run "$([[ $t == lxc ]] && echo pct || echo qm)" delsnapshot "$id" "$sn"; done
+      fi
+      log "Removed $name. Its log stays in $SCHED_LOG/$name.log" ;;
+  esac
+}
+
+chk_schedule() {
+  local names name st n=0 bad=() off=() late=() min mon last_end
+  names="$(job_names 2>/dev/null)"
+  [[ -n "$names" ]] || return 0
+  while IFS= read -r name; do
+    n=$(( n + 1 ))
+    if ! job_load "$name" 2>/dev/null; then bad+=("$name (invalid file)"); continue; fi
+    st="$(state_get "$name" status)"
+    systemctl is-enabled --quiet "$JOB_UNIT@$name.timer" 2>/dev/null || off+=("$name")
+    [[ "$st" == failed || "$st" == warning ]] && bad+=("$name ($st)")
+    last_end="$(state_get "$name" last_end)"
+    if [[ -n "${J[EVERY]}" && "$last_end" =~ ^[0-9]+$ ]]; then
+      read -r min mon <<<"$(parse_every "${J[EVERY]}")"
+      (( mon )) && min=$(( mon * 31 * 1440 ))
+      (( $(sched_now) - last_end > min * 120 + 7200 )) && late+=("$name")
+    fi
+    detail "Scheduled" "$name: ${J[TYPE]} $(schedule_text), last $(fmt_ts "$(state_get "$name" last_start)") ${st:-never}"
+  done <<<"$names"
+  if (( ${#bad[@]} )); then res WARN "Scheduled jobs" "${#bad[@]} of $n need attention: ${bad[*]}" 5.3
+  elif (( ${#late[@]} )); then res WARN "Scheduled jobs" "overdue: ${late[*]}" 5.3
+  else res OK "Scheduled jobs" "$n job(s)$( (( ${#off[@]} )) && echo ", paused: ${off[*]}"), last runs OK"; fi
+  return 0
+}
+
+# ---- command line ----------------------------------------------------------------------
+sched_usage() {
+  cat <<EOF
+proxmox-toolbelt schedule - scheduled snapshots and backups (systemd timers, survive reboots)
+
+  schedule list
+  schedule add snapshot NAME --every 1h --guests all [--exclude 105] [--keep 24] [--vmstate]
+  schedule add backup NAME --every 1d --at 02:00 --guests 100,101 --storage local [--keep 7]
+           [--retention keep-daily=7,keep-weekly=4] [--mode snapshot|suspend|stop] [--compress zstd]
+  schedule run NAME [--dry-run]     run now (ignores the interval), output on the terminal
+  schedule status NAME              settings, last result, next run, log tail
+  schedule log NAME [LINES]
+  schedule pause NAME | resume NAME
+  schedule remove NAME              the snapshots and backups it made are kept
+
+  --every   10m 30m 1h 10h 24h 1d 2w 1mo 1h30m (m = minutes, mo = months; at least 5m)
+  --calendar SPEC   systemd calendar instead of --every, e.g. 'Mon..Fri 22:00'
+  --at HH:MM        time of day for intervals in whole days, weeks or months (default 02:00)
+  --guests  all | pool:NAME | 100,101,200-210        --exclude IDs (with all or pool:)
+  --max-used PCT    skip the run when the storage is PCT% full or more (default 90)
+  --notify failure|always|never   mail to root (forwarded to root@pam's address)
+  --dry-run         show what would be written or run
+EOF
+}
+
+sched_cli() {
+  local cmd="${1:-list}"; (( $# )) && shift
+  local args=() a
+  for a in "$@"; do case "$a" in --dry-run|-n) DRY_RUN=1 ;; *) args+=("$a") ;; esac; done
+  set -- "${args[@]}"
+  case "$cmd" in
+    list|ls) view_schedules ;;
+    tick) [[ -n "${1:-}" ]] || die "schedule tick NAME"
+          job_tick "$1"; [[ "$JOB_RESULT" != failed ]] || exit 1 ;;
+    run) [[ -n "${1:-}" ]] || die "schedule run NAME"
+         job_exec "$1" "" 1
+         case "$JOB_RESULT" in failed) exit 1 ;; busy) exit 75 ;; esac ;;
+    status) [[ -n "${1:-}" ]] || die "schedule status NAME"; job_status "$1" ;;
+    log) [[ -n "${1:-}" ]] || die "schedule log NAME [LINES]"; v_jobname "$1" || exit 1
+         tail -n "${2:-100}" "$SCHED_LOG/$1.log" 2>/dev/null || die "No log for $1 yet" ;;
+    pause|disable) job_load "${1:-}" || exit 1; run systemctl disable --now "$JOB_UNIT@$1.timer" ;;
+    resume|enable) job_load "${1:-}" || exit 1; sched_require_prog; run systemctl enable --now "$JOB_UNIT@$1.timer" ;;
+    remove|rm) job_load "${1:-}" || exit 1; job_remove "$1"; log "Removed job $1 (snapshots, backups and $SCHED_LOG/$1.log are kept)" ;;
+    recover) sched_recover ;;
+    add) sched_cli_add "$@" ;;
+    help|--help|-h) sched_usage ;;
+    *) sched_usage >&2; die "Unknown schedule command: $cmd" ;;
+  esac
+}
+
+sched_cli_add() {
+  local type="${1:-}" name="${2:-}"
+  [[ "$type" == snapshot || "$type" == backup ]] || die "schedule add snapshot|backup NAME ..."
+  v_newjob "$name" || exit 1
+  shift 2
+  job_defaults "$name"; J[TYPE]="$type"
+  [[ "$type" == snapshot ]] && J[AT]="01:00"
+  while (( $# )); do
+    case "$1" in
+      --every) J[EVERY]="${2:-}"; shift ;;
+      --calendar) J[CALENDAR]="${2:-}"; shift ;;
+      --at) J[AT]="${2:-}"; shift ;;
+      --guests) J[GUESTS]="${2:-}"; shift ;;
+      --exclude) J[EXCLUDE]="${2:-}"; shift ;;
+      --keep) J[KEEP]="${2:-}"; shift ;;
+      --retention) J[RETENTION]="${2:-}"; shift ;;
+      --storage) J[STORAGE]="${2:-}"; shift ;;
+      --mode) J[MODE]="${2:-}"; shift ;;
+      --compress) J[COMPRESS]="${2:-}"; shift ;;
+      --max-used) J[MAX_USED]="${2:-}"; shift ;;
+      --notify) J[NOTIFY]="${2:-}"; shift ;;
+      --vmstate) J[VMSTATE]=1 ;;
+      *) die "Unknown option for schedule add: $1" ;;
+    esac
+    shift
+  done
+  [[ -z "${J[EVERY]}" ]] || parse_every "${J[EVERY]}" >/dev/null || { v_every "${J[EVERY]}"; exit 1; }
+  J[EVERY]="${J[EVERY],,}"
+  job_check_all || die "Invalid job settings (see: proxmox-toolbelt schedule help)"
+  local resolved
+  resolved="$(resolve_guests "${J[GUESTS]}" "${J[EXCLUDE]}" "$([[ $type == snapshot ]] && echo 1 || echo 0)")" || exit 1
+  [[ -n "$resolved" ]] || warn "No guest on $NODE matches '${J[GUESTS]}' yet"
+  if [[ "$type" == snapshot ]]; then
+    local id t c
+    while IFS='|' read -r id t _; do
+      [[ -n "$id" ]] || continue
+      c="$(snap_capable "$(guest_conf_path "$id" "$t")")"
+      [[ "$c" == yes ]] || warn "Guest $id: $c - it cannot be snapshotted; use a backup job for it"
+    done <<<"$resolved"
+  else
+    is_backup_storage "${J[STORAGE]}" || die "Storage ${J[STORAGE]} does not exist or does not allow backups (content 'VZDump backup file')"
+  fi
+  sched_require_prog
+  job_install
+  (( DRY_RUN )) || log "Job $name: ${J[TYPE]} $(schedule_text). Test it now: proxmox-toolbelt schedule run $name"
 }
 
 # ---------------------------------------------------------------------------
@@ -2829,7 +3901,23 @@ fix_uninstall() {
   fi
   done
 
-  # 5) program and defaults file
+  # 5) scheduled snapshot/backup jobs: timers, job files, state, logs (snapshots and backups stay)
+  local jobs j
+  jobs="$(job_names | paste -sd' ' -)"
+  if [[ -n "$jobs" || -e "$UNIT_DIR/$JOB_UNIT@.service" || -d "$SCHED_STATE" || -d "$SCHED_LOG" ]]; then
+    echo "${C_B}Scheduled jobs${C_0}  ${jobs:-no jobs left} ($SCHED_DIR, timers in $UNIT_DIR, logs in $SCHED_LOG)"
+    hint "Snapshots and backup files that the jobs made are kept."
+    if confirm "Remove the scheduled jobs, their timers, state and logs?"; then
+      for j in $jobs; do job_remove "$j"; done
+      run rm -f "$UNIT_DIR/$JOB_UNIT@.service" "$UNIT_DIR/$RECOVER_UNIT"
+      run rm -rf -- "$SCHED_STATE" "$SCHED_LOG"
+      [[ -d "$SCHED_DIR" ]] && run rmdir --ignore-fail-on-non-empty "$SCHED_DIR" "$(dirname "$SCHED_DIR")"
+      removed=$(( removed + 1 ))
+    fi
+    echo
+  fi
+
+  # 6) program and defaults file
   local pv; pv="$(pkg_version)"
   if [[ -n "$pv" ]]; then
     echo "${C_B}Debian package${C_0}  proxmox-toolbelt $pv"
@@ -2875,7 +3963,11 @@ MENU_3=("Switch repository (no-subscription / enterprise)|fix_repos|fix" "Instal
         "Install CPU microcode|fix_microcode|fix" "Show Proxmox package versions|view_versions|view")
 MENU_4=("Storage usage and content types|view_storage|view" "Enable snippets on a storage|fix_snippets|fix"
         "Disks: used, unused, SMART, wear|view_disks|view" "Unused and orphaned disk images|view_orphans|view")
-MENU_5=("Backup jobs and guests not covered|view_backups|view" "Recent backup runs|view_backup_tasks|view")
+MENU_5=("Backup jobs and guests not covered|view_backups|view" "Recent backup runs|view_backup_tasks|view"
+        "Scheduled snapshots and backups: list and status|view_schedules|view"
+        "Add a scheduled snapshot job (every 10m, 1h, 1d, ...)|add_snapshot_job|fix"
+        "Add a scheduled backup job (vzdump, any storage)|add_backup_job|fix"
+        "Run, test, pause, resume or remove a scheduled job|manage_jobs|fix")
 MENU_6=("Set root@pam e-mail|fix_root_email|fix" "Add SMTP e-mail target (Gmail, Outlook, custom)|fix_smtp|fix"
         "Add Gotify target|fix_gotify|fix" "Add ntfy target|fix_ntfy|fix" "Add alert rule (matcher)|fix_matcher|fix"
         "Send a test notification|fix_test_notify|fix" "Show targets and rules|view_notify|view")
@@ -2940,7 +4032,7 @@ main_menu() {
     echo
     echo "  1) Full report      2) Security    3) Updates     4) Storage   5) Backups"
     echo "  6) Notifications    7) VMs/CTs     8) System      r) Re-check  q) Quit"
-    echo "  ${C_D}Enter a menu number or an entry such as 2.2 (7.2 create VM, 7.3 create container).${C_0}"
+    echo "  ${C_D}Enter a menu number or an entry such as 2.2 (7.2 create VM, 5.4 scheduled snapshots).${C_0}"
     read -erp "Choice: " c || { echo; exit 0; }
     case "$c" in
       q|Q) exit 0 ;;
@@ -2966,6 +4058,8 @@ proxmox-toolbelt.sh $VERSION - health checks, configuration changes, VM and cont
   proxmox-toolbelt.sh create-vm [--dry-run]    VM builder (same as create-vm.sh)
   proxmox-toolbelt.sh create-ct [--dry-run]    container builder (same as create-ct.sh)
   proxmox-toolbelt.sh templates [--dry-run]    VM template builder
+  proxmox-toolbelt.sh schedule [list|add|run|status|log|pause|resume|remove|help]
+                                             scheduled snapshots and backups (see: schedule help)
 
   --dry-run   print diffs and commands instead of applying them
   --help      show this help
@@ -2975,11 +4069,12 @@ EOF
 }
 
 main() {
-  local mode=menu json=0 details=0
+  local mode=menu json=0 details=0 SCHED_ARGS=()
   case "${0##*/}" in create-vm*) mode=create-vm ;; create-ct*) mode=create-ct ;; esac
   while (( $# )); do
     case "$1" in
       check|info|uninstall|create-vm|create-ct|templates) mode="$1" ;;
+      schedule) mode=schedule; shift; SCHED_ARGS=("$@"); break ;;
       --json) json=1 ;;
       --details|-v) details=1 ;;
       --dry-run|-n) DRY_RUN=1 ;;
@@ -2989,6 +4084,7 @@ main() {
     esac
     shift
   done
+  if [[ "$mode" == schedule && "${SCHED_ARGS[0]:-}" =~ ^(help|--help|-h)$ ]]; then sched_usage; exit 0; fi
   save_tty
   load_config
   if [[ "$mode" == create-[vc][mt] ]] && (( DRY_RUN )); then :; else need_root; fi
@@ -3002,6 +4098,7 @@ main() {
       local rc=0; results_rc || rc=$?
       exit "$rc" ;;
     info) view_sysinfo ;;
+    schedule) sched_cli "${SCHED_ARGS[@]}" ;;
     uninstall)
       [[ -t 0 ]] || die "Run interactively (stdin must be a terminal)"
       fix_uninstall ;;
