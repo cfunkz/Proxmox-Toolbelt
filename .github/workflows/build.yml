@@ -21,6 +21,7 @@ jobs:
         run: |
           bash tests/test-helpers.sh
           bash tests/test-checks.sh
+          bash tests/test-schedule.sh
 
   deb:
     needs: test

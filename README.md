@@ -5,6 +5,8 @@ Interactive system checks and VM/CT launcher for the Proxmox VE 8/9 shell.
 - **Status board:** read-only checks for 2FA, SSH, certificates, firewall, repositories,
   updates, storage, disks, backups and notifications.
 - **Guided fixes:** every change shows a diff or the exact commands and asks first.
+- **Scheduled snapshots and backups:** every 10m, 10h, 1d, 1mo and so on, on ZFS, LVM-thin and
+  plain LVM. Runs missed while the node was off are made up after boot.
 - **Builders:** cloud-init VMs, LXC containers and VM templates. Each prompt lists what the
   host actually has: storages, bridges, VLANs, free IP addresses and SSH keys.
 
@@ -46,6 +48,7 @@ Releases include `SHA256SUMS` and a GitHub build attestation:
 | `proxmox-toolbelt create-vm` | VM builder |
 | `proxmox-toolbelt create-ct` | Container builder |
 | `proxmox-toolbelt templates` | VM template builder |
+| `proxmox-toolbelt schedule ...` | Scheduled snapshots and backups: `list`, `add`, `run`, `status`, `log`, `pause`, `resume`, `remove` (see below) |
 | `proxmox-toolbelt uninstall` | Remove the program, defaults file, image cache and backups (each confirmed) |
 
 Add `--dry-run` to any command to print the changes instead of applying them.
@@ -66,7 +69,7 @@ Add `--dry-run` to any command to print the changes instead of applying them.
 | Updates | Pending packages; stale package lists; reboot needed for a new kernel; interrupted dpkg run; CPU microcode |
 | Storage | Usage per storage; inactive storage; LVM-thin metadata; ZFS pool health and scrub age |
 | Disks | SMART status; SSD wear; unused disks; unused disk images in VM/CT configs |
-| Backups | Backup jobs; VMs/CTs not covered by any job; result and age of the last backup |
+| Backups | Backup jobs; VMs/CTs not covered by any job; result and age of the last backup; failed or overdue scheduled jobs |
 | Notifications | Targets and matchers; root@pam e-mail; mail relay and postfix |
 | System | Node name in `/etc/hosts`; NTP; root disk and memory usage; cluster quorum |
 
@@ -83,14 +86,15 @@ because cluster nodes use root SSH between each other.
 | Storage | Enable `snippets` content on a storage |
 | Notifications | root@pam e-mail; SMTP (Gmail, Outlook, custom), Gotify and ntfy targets; alert rules; test message |
 
-2FA enrollment, ACME, firewall rules, disks and backup jobs are not changed. For these, the
+2FA enrollment, ACME, firewall rules, disks and Proxmox backup jobs (Datacenter > Backup) are not changed. For these, the
 views show where to configure them in the GUI.
 
 ### Safety
 
 - Every change shows a diff or the commands first. Confirmation prompts default to No.
 - Edited files are backed up to `/root/proxmox-toolbelt-backups/<timestamp>/`.
-- The script never deletes VMs, containers, disks, storage or backups.
+- The script never deletes VMs, containers, disks or storage. Scheduled jobs delete only their
+  own old snapshots (`ptb_<job>_...`) and let vzdump prune backups by the job's retention.
 - SSH changes are tested with `sshd -t`. They are reverted automatically after 120 seconds
   unless you type `keep` after a successful login from a new session. The revert runs as a
   systemd timer, so it also fires if the connection drops.
@@ -152,6 +156,74 @@ Creates an LXC container from the Proxmox template index:
 
 ![Container builder: summary](docs/screenshots/ct-create.png)
 
+## Scheduled snapshots and backups
+
+Menu 5.3 to 5.6, or `proxmox-toolbelt schedule`. Two kinds of jobs:
+
+| Job | What it does | Storage |
+|-----|--------------|---------|
+| snapshot | `qm snapshot` / `pct snapshot` of each guest, named `ptb_<job>_<YYYYMMDD>_<HHMMSS>`. Shows in the guest's Snapshots tab. | ZFS, LVM-thin, Ceph RBD, BTRFS, qcow2 on directory/NFS. Not plain (thick) LVM or raw files. |
+| backup | `vzdump` to a backup storage (directory, NFS, CIFS, Proxmox Backup Server), retry for failed guests | Guests on any storage, including plain LVM |
+
+With `--guests all` or `pool:NAME`, guests whose disks cannot be snapshotted are skipped and
+listed in the job result; guests listed by ID are reported as failed instead.
+
+A snapshot is stored on the same disks as the guest, so it does not protect against a failed disk or
+pool. Use a backup job for that, or both: for example snapshots every hour, kept for a day, and a
+backup every night, kept for a week.
+
+```bash
+# snapshots of all guests every hour, keep 24, except VM 105
+proxmox-toolbelt schedule add snapshot hourly --every 1h --guests all --exclude 105 --keep 24
+# nightly backup of 100 and 101 at 02:00 to storage "local", keep 7
+proxmox-toolbelt schedule add backup nightly --every 1d --at 02:00 --guests 100,101 --storage local --keep 7
+# Proxmox retention rules instead of keep-last
+proxmox-toolbelt schedule add backup weekly --every 1w --guests pool:prod --storage pbs \
+  --retention keep-weekly=4,keep-monthly=6
+# weekday evenings with a systemd calendar expression
+proxmox-toolbelt schedule add backup office --calendar 'Mon..Fri 22:00' --guests all --storage nfs
+proxmox-toolbelt schedule list
+proxmox-toolbelt schedule run hourly --dry-run    # show what it would do
+proxmox-toolbelt schedule run hourly              # run now, output on the terminal
+```
+
+Intervals: `10m`, `30m`, `1h`, `10h`, `24h`, `1d`, `2w`, `1mo`, `3mo`, combinations such as
+`1h30m`, or `hourly`/`daily`/`weekly`/`monthly`. `m` is minutes and `mo` is months; the minimum is 5 minutes.
+Intervals in whole days or weeks run at `--at` (default 02:00, 01:00 for snapshots); month
+intervals run on the 1st of the month at that time. The first run is at the next tick after the
+job is created.
+
+How it survives reboots and failures:
+
+- Each job has a systemd timer `proxmox-toolbelt-job@<job>.timer` with `Persistent=true`. The
+  timer ticks on a fixed grid (every 10 minutes for `10m`, hourly for `10h`, daily for `1d`), and
+  each tick runs the job only when the interval since the last completed run has passed. A tick
+  missed while the node was off fires right after boot, so an overdue job runs then.
+- A run cut short by a reboot, crash or kill is not counted as done. At boot,
+  `proxmox-toolbelt-schedule-recover.service` starts it again. First it removes guest locks
+  (`lock: backup` or `lock: snapshot`) and half-made `ptb_` snapshots that the run left behind,
+  as long as no backup or snapshot process is still running.
+- A lock (`flock`) per job prevents two runs at the same time. Snapshot and backup jobs run after
+  `pve-cluster` and `pve-guests` at boot, and are stopped before the guests at shutdown.
+- Each guest is tried 3 times, 60 seconds apart. vzdump is run again only for the guests that failed.
+- A run is skipped, and reported as failed, when the storage is 90% full or more (`--max-used`).
+  On LVM-thin, the metadata of the thin pool is checked as well, because a full thin pool stops all
+  guests on it. A run also stops when the cluster has no quorum.
+- Old snapshots are deleted only after the new one was taken, and only the job's own `ptb_<job>_`
+  snapshots are counted. For backups, `--prune-backups` counts all backups of a guest on that
+  storage, including those made by other jobs or by hand (protected backups are never pruned).
+- Results are kept in `/var/lib/proxmox-toolbelt/schedule/<job>.state` and logged to
+  `/var/log/proxmox-toolbelt/<job>.log` and the journal (`journalctl -u 'proxmox-toolbelt-job@*'`).
+  On failure, root gets an e-mail, which Proxmox forwards to root@pam's address (`--notify
+  failure|always|never`). The status board shows failed and overdue jobs.
+
+Job settings are in `/etc/proxmox-toolbelt/schedule/<job>.conf` (read as `KEY=value`, never
+sourced). To change a job, remove it and add it again. Removing a job keeps its snapshots and
+backups; menu 5.6 offers to delete the job's snapshots too.
+
+Rollback on ZFS: Proxmox can only roll back to the newest snapshot on ZFS. To go back further,
+delete the newer snapshots first, or restore a backup.
+
 ## Static IP suggestion
 
 For a static NIC, both builders work out the subnet and gateway before asking:
@@ -181,6 +253,7 @@ by root and not writable by group or others.
 ```bash
 bash tests/test-helpers.sh      # no Proxmox needed, commands are mocked
 bash tests/test-checks.sh
+bash tests/test-schedule.sh
 bash packaging/build-deb.sh     # dist/proxmox-toolbelt_<version>_all.deb
 ```
 

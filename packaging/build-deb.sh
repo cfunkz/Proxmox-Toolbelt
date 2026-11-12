@@ -49,17 +49,30 @@ Description: Interactive system checks and VM/CT launcher for Proxmox VE
  Status board with read-only checks for a Proxmox VE 8/9 node (2FA, SSH,
  certificate, firewall, repositories, updates, storage, disks, backups,
  notifications), guided fixes that show a diff before applying, and
- builders for cloud-init VMs, LXC containers and VM templates.
+ builders for cloud-init VMs, LXC containers and VM templates, and
+ scheduled snapshots and backups (systemd timers that survive reboots).
  .
  Run: proxmox-toolbelt
 C
 
-# Removes only the defaults file on purge; image cache and backups stay (proxmox-toolbelt uninstall).
+# Purge removes the defaults file and the scheduled jobs (timers, job files, state, logs).
+# Image cache, file backups, snapshots and vzdump backups stay (proxmox-toolbelt uninstall).
+# On remove without purge the job timers stay but do nothing (ConditionPathExists on the program).
 cat >"$root/DEBIAN/postrm" <<'C'
 #!/bin/sh
 set -e
 if [ "$1" = purge ]; then
   rm -f /etc/proxmox-toolbelt.conf
+  for t in /etc/systemd/system/proxmox-toolbelt-job@*.timer; do
+    [ -e "$t" ] || continue
+    systemctl disable --now "$(basename "$t")" >/dev/null 2>&1 || true
+    rm -f "$t"
+  done
+  systemctl disable proxmox-toolbelt-schedule-recover.service >/dev/null 2>&1 || true
+  rm -f /etc/systemd/system/proxmox-toolbelt-job@.service /etc/systemd/system/proxmox-toolbelt-schedule-recover.service
+  rm -rf /etc/proxmox-toolbelt/schedule /var/lib/proxmox-toolbelt /var/log/proxmox-toolbelt
+  rmdir /etc/proxmox-toolbelt 2>/dev/null || true
+  systemctl daemon-reload >/dev/null 2>&1 || true
 fi
 exit 0
 C
